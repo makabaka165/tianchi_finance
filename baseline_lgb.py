@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stopping-rounds", type=int, default=100, help="Early stopping rounds")
     parser.add_argument("--sample-rows", type=int, default=0, help="Use first N train rows for a quick smoke test")
     parser.add_argument("--n-jobs", type=int, default=-1, help="LightGBM thread count")
+    parser.add_argument("--target-encoding", action="store_true", help="Add fold-safe target encoding features")
+    parser.add_argument("--target-encoding-splits", type=int, default=5, help="Inner folds for train target encoding")
+    parser.add_argument("--target-encoding-smoothing", type=float, default=20.0, help="Smoothing for target encoding")
     return parser.parse_args()
 
 
@@ -180,6 +183,81 @@ def reduce_memory(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def make_category_key(series: pd.Series) -> pd.Series:
+    return series.fillna(-999999).astype("float64")
+
+
+def fit_smoothed_target_mapping(
+    keys: pd.Series,
+    target: np.ndarray,
+    global_mean: float,
+    smoothing: float,
+) -> pd.Series:
+    stats = pd.DataFrame({"key": keys, "target": target}).groupby("key", dropna=False)["target"].agg(
+        ["mean", "count"]
+    )
+    return (stats["mean"] * stats["count"] + global_mean * smoothing) / (stats["count"] + smoothing)
+
+
+def map_target_encoding(keys: pd.Series, mapping: pd.Series, global_mean: float) -> pd.Series:
+    return keys.map(mapping).fillna(global_mean).astype("float32")
+
+
+def add_fold_target_encoding(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_valid: pd.DataFrame,
+    X_test: pd.DataFrame,
+    cols: list[str],
+    inner_splits: int,
+    seed: int,
+    smoothing: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    target_cols = [col for col in cols if col in X_train.columns]
+    if not target_cols:
+        return X_train, X_valid, X_test
+
+    y_train = np.asarray(y_train)
+    global_mean = float(np.mean(y_train))
+    min_class_count = int(np.bincount(y_train).min())
+    inner_splits = max(2, min(inner_splits, min_class_count))
+
+    train_features: dict[str, np.ndarray] = {}
+    valid_features: dict[str, pd.Series] = {}
+    test_features: dict[str, pd.Series] = {}
+    inner_cv = StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=seed)
+
+    for col in target_cols:
+        train_key = make_category_key(X_train[col]).reset_index(drop=True)
+        valid_key = make_category_key(X_valid[col])
+        test_key = make_category_key(X_test[col])
+
+        train_encoded = np.full(len(X_train), global_mean, dtype=np.float32)
+        for inner_train_idx, inner_valid_idx in inner_cv.split(np.zeros(len(y_train)), y_train):
+            mapping = fit_smoothed_target_mapping(
+                train_key.iloc[inner_train_idx],
+                y_train[inner_train_idx],
+                global_mean,
+                smoothing,
+            )
+            train_encoded[inner_valid_idx] = map_target_encoding(
+                train_key.iloc[inner_valid_idx],
+                mapping,
+                global_mean,
+            ).to_numpy(dtype=np.float32)
+
+        full_mapping = fit_smoothed_target_mapping(train_key, y_train, global_mean, smoothing)
+        feature_name = f"{col}_target_mean"
+        train_features[feature_name] = train_encoded
+        valid_features[feature_name] = map_target_encoding(valid_key, full_mapping, global_mean)
+        test_features[feature_name] = map_target_encoding(test_key, full_mapping, global_mean)
+
+    X_train_aug = pd.concat([X_train.reset_index(drop=True), pd.DataFrame(train_features)], axis=1)
+    X_valid_aug = pd.concat([X_valid.reset_index(drop=True), pd.DataFrame(valid_features).reset_index(drop=True)], axis=1)
+    X_test_aug = pd.concat([X_test.reset_index(drop=True), pd.DataFrame(test_features).reset_index(drop=True)], axis=1)
+    return X_train_aug, X_valid_aug, X_test_aug
+
+
 def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     y = train["isDefault"].astype("int8")
     train_x = train.drop(columns=["isDefault"])
@@ -259,14 +337,41 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
     oof = np.zeros(len(X), dtype=np.float32)
     test_pred = np.zeros(len(X_test), dtype=np.float32)
     fold_scores: list[float] = []
-    feature_importances = pd.DataFrame({"feature": X.columns})
+    feature_importances: pd.DataFrame | None = None
 
     skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
+    target_encoding_cols = [
+        "grade",
+        "subGrade",
+        "employmentTitle",
+        "postCode",
+        "regionCode",
+        "purpose",
+        "title",
+        "homeOwnership",
+        "verificationStatus",
+    ]
 
     for fold, (train_idx, valid_idx) in enumerate(skf.split(X, y_array), start=1):
         print(f"\nFold {fold}/{args.n_splits}")
         X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
         y_train, y_valid = y_array[train_idx], y_array[valid_idx]
+        X_test_fold = X_test
+
+        if args.target_encoding:
+            X_train, X_valid, X_test_fold = add_fold_target_encoding(
+                X_train,
+                y_train,
+                X_valid,
+                X_test,
+                cols=target_encoding_cols,
+                inner_splits=args.target_encoding_splits,
+                seed=args.seed + fold,
+                smoothing=args.target_encoding_smoothing,
+            )
+
+        if feature_importances is None:
+            feature_importances = pd.DataFrame({"feature": X_train.columns})
 
         model = lgb.LGBMClassifier(**params)
         model.fit(
@@ -286,7 +391,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         oof[valid_idx] = valid_pred.astype(np.float32)
 
         test_pred += (
-            model.predict_proba(X_test, num_iteration=model.best_iteration_)[:, 1].astype(np.float32)
+            model.predict_proba(X_test_fold, num_iteration=model.best_iteration_)[:, 1].astype(np.float32)
             / args.n_splits
         )
         feature_importances[f"fold_{fold}"] = model.feature_importances_
@@ -302,6 +407,8 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
     oof_path = output_dir / f"oof_{args.run_name}.csv"
     pd.DataFrame({"isDefault": y_array, "pred": oof}).to_csv(oof_path, index=False)
 
+    if feature_importances is None:
+        raise RuntimeError("No model was trained, feature importances are unavailable.")
     feature_importances["importance_mean"] = feature_importances.filter(like="fold_").mean(axis=1)
     feature_importances = feature_importances.sort_values("importance_mean", ascending=False)
     importance_path = output_dir / f"feature_importance_{args.run_name}.csv"
@@ -319,6 +426,12 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "oof_path": str(oof_path),
         "importance_path": str(importance_path),
         "params": params,
+        "target_encoding": {
+            "enabled": args.target_encoding,
+            "cols": target_encoding_cols if args.target_encoding else [],
+            "inner_splits": args.target_encoding_splits if args.target_encoding else None,
+            "smoothing": args.target_encoding_smoothing if args.target_encoding else None,
+        },
     }
     metrics_path = output_dir / f"metrics_{args.run_name}.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
