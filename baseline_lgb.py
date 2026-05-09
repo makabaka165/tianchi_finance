@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import time
 from pathlib import Path
 
@@ -34,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-path", default="train.csv", help="Path to train.csv")
     parser.add_argument("--test-path", default="testA.csv", help="Path to testA.csv")
     parser.add_argument("--output-dir", default="outputs", help="Directory for generated files")
+    parser.add_argument("--run-name", default="lgb_baseline", help="Prefix used for generated file names")
     parser.add_argument("--n-splits", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed")
     parser.add_argument("--n-estimators", type=int, default=2000, help="Maximum boosting rounds")
@@ -57,6 +57,8 @@ def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
     issue_date = pd.to_datetime(df["issueDate"], errors="coerce")
     df["issue_year"] = issue_date.dt.year.astype("float32")
     df["issue_month"] = issue_date.dt.month.astype("float32")
+    df["issue_quarter"] = issue_date.dt.quarter.astype("float32")
+    df["issue_half_year"] = ((df["issue_month"] > 6).astype("float32") + 1).astype("float32")
     df["issue_month_index"] = (df["issue_year"] * 12 + df["issue_month"]).astype("float32")
 
     early = df["earliesCreditLine"].astype("string").str.extract(r"([A-Za-z]{3})-(\d{4})")
@@ -68,6 +70,19 @@ def add_date_features(df: pd.DataFrame) -> pd.DataFrame:
     df["credit_history_months"] = (
         df["issue_month_index"] - df["earlies_credit_month_index"]
     ).astype("float32")
+    df["credit_history_years"] = (df["credit_history_months"] / 12).astype("float32")
+    return df
+
+
+def add_grade_features(df: pd.DataFrame) -> pd.DataFrame:
+    grade_map = {grade: idx for idx, grade in enumerate("ABCDEFG", start=1)}
+    grade_rank = df["grade"].map(grade_map).astype("float32")
+    subgrade = df["subGrade"].astype("string").str.extract(r"([A-G])(\d+)")
+    subgrade_grade = subgrade[0].map(grade_map).astype("float32")
+    subgrade_number = pd.to_numeric(subgrade[1], errors="coerce").astype("float32")
+
+    df["grade_rank"] = grade_rank
+    df["subgrade_rank"] = ((subgrade_grade - 1) * 5 + subgrade_number).astype("float32")
     return df
 
 
@@ -75,14 +90,41 @@ def add_numeric_features(df: pd.DataFrame) -> pd.DataFrame:
     annual_income = df["annualIncome"].replace(0, np.nan)
     total_acc = df["totalAcc"].replace(0, np.nan)
     open_acc = df["openAcc"].replace(0, np.nan)
+    term_months = (df["term"] * 12).replace(0, np.nan)
 
     df["fico_mean"] = ((df["ficoRangeLow"] + df["ficoRangeHigh"]) / 2).astype("float32")
     df["fico_range"] = (df["ficoRangeHigh"] - df["ficoRangeLow"]).astype("float32")
+    df["term_months"] = term_months.astype("float32")
     df["loan_income_ratio"] = (df["loanAmnt"] / annual_income).astype("float32")
     df["installment_income_ratio"] = ((df["installment"] * 12) / annual_income).astype("float32")
     df["revolbal_income_ratio"] = (df["revolBal"] / annual_income).astype("float32")
     df["openacc_totalacc_ratio"] = (open_acc / total_acc).astype("float32")
     df["revolbal_openacc_ratio"] = (df["revolBal"] / open_acc).astype("float32")
+    df["loan_term_ratio"] = (df["loanAmnt"] / term_months).astype("float32")
+    df["interest_loan_income_ratio"] = (df["interestRate"] * df["loan_income_ratio"]).astype("float32")
+    df["dti_loan_income_ratio"] = (df["dti"] * df["loan_income_ratio"]).astype("float32")
+    df["dti_installment_income_ratio"] = (df["dti"] * df["installment_income_ratio"]).astype("float32")
+    df["revolutil_dti_ratio"] = (df["revolUtil"] * df["dti"]).astype("float32")
+    df["annual_income_log1p"] = np.log1p(df["annualIncome"].clip(lower=0)).astype("float32")
+    df["loan_amnt_log1p"] = np.log1p(df["loanAmnt"].clip(lower=0)).astype("float32")
+    df["installment_log1p"] = np.log1p(df["installment"].clip(lower=0)).astype("float32")
+    df["revolbal_log1p"] = np.log1p(df["revolBal"].clip(lower=0)).astype("float32")
+    return df
+
+
+def add_anonymous_aggregate_features(df: pd.DataFrame) -> pd.DataFrame:
+    n_cols = [f"n{i}" for i in range(15) if f"n{i}" in df.columns]
+    if not n_cols:
+        return df
+
+    n_data = df[n_cols]
+    df["n_missing_count"] = n_data.isna().sum(axis=1).astype("float32")
+    df["n_zero_count"] = n_data.eq(0).sum(axis=1).astype("float32")
+    df["n_sum"] = n_data.sum(axis=1, skipna=True).astype("float32")
+    df["n_mean"] = n_data.mean(axis=1, skipna=True).astype("float32")
+    df["n_std"] = n_data.std(axis=1, skipna=True).astype("float32")
+    df["n_max"] = n_data.max(axis=1, skipna=True).astype("float32")
+    df["n_min"] = n_data.min(axis=1, skipna=True).astype("float32")
     return df
 
 
@@ -93,6 +135,29 @@ def add_count_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         key = df[col].astype("string").fillna("__MISSING__")
         counts = key.value_counts(dropna=False)
         df[f"{col}_count"] = key.map(counts).astype("float32")
+    return df
+
+
+def add_group_stat_features(df: pd.DataFrame) -> pd.DataFrame:
+    group_cols = ["postCode", "regionCode", "purpose", "grade", "subGrade", "homeOwnership"]
+    agg_cols = ["loanAmnt", "annualIncome", "interestRate", "dti", "revolUtil", "installment"]
+    new_features: dict[str, pd.Series] = {}
+
+    for group_col in group_cols:
+        if group_col not in df.columns:
+            continue
+        group_key = df[group_col].astype("string").fillna("__MISSING__")
+        for agg_col in agg_cols:
+            if agg_col not in df.columns:
+                continue
+            group_mean = df[agg_col].groupby(group_key, dropna=False).transform("mean")
+            new_features[f"{agg_col}_mean_by_{group_col}"] = group_mean.astype("float32")
+            new_features[f"{agg_col}_diff_mean_by_{group_col}"] = (
+                df[agg_col] - group_mean
+            ).astype("float32")
+
+    if new_features:
+        df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
     return df
 
 
@@ -122,11 +187,24 @@ def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFram
 
     all_data["employmentLength"] = employment_length_to_years(all_data["employmentLength"])
     all_data = add_date_features(all_data)
+    all_data = add_grade_features(all_data)
     all_data = add_numeric_features(all_data)
+    all_data = add_anonymous_aggregate_features(all_data)
     all_data = add_count_features(
         all_data,
-        ["employmentTitle", "postCode", "title", "regionCode", "purpose"],
+        [
+            "employmentTitle",
+            "postCode",
+            "title",
+            "regionCode",
+            "purpose",
+            "grade",
+            "subGrade",
+            "homeOwnership",
+            "verificationStatus",
+        ],
     )
+    all_data = add_group_stat_features(all_data)
 
     drop_cols = ["id", "issueDate", "earliesCreditLine", "policyCode"]
     all_data = all_data.drop(columns=[col for col in drop_cols if col in all_data.columns])
@@ -218,18 +296,19 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
     elapsed = time.time() - start
 
     submission = pd.DataFrame({"id": test_ids, "isDefault": test_pred})
-    submission_path = output_dir / "submission_lgb_baseline.csv"
+    submission_path = output_dir / f"submission_{args.run_name}.csv"
     submission.to_csv(submission_path, index=False)
 
-    oof_path = output_dir / "oof_lgb_baseline.csv"
+    oof_path = output_dir / f"oof_{args.run_name}.csv"
     pd.DataFrame({"isDefault": y_array, "pred": oof}).to_csv(oof_path, index=False)
 
     feature_importances["importance_mean"] = feature_importances.filter(like="fold_").mean(axis=1)
     feature_importances = feature_importances.sort_values("importance_mean", ascending=False)
-    importance_path = output_dir / "feature_importance_lgb_baseline.csv"
+    importance_path = output_dir / f"feature_importance_{args.run_name}.csv"
     feature_importances.to_csv(importance_path, index=False)
 
     metrics = {
+        "run_name": args.run_name,
         "cv_auc": float(cv_auc),
         "fold_auc": fold_scores,
         "elapsed_seconds": round(elapsed, 2),
@@ -241,7 +320,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "importance_path": str(importance_path),
         "params": params,
     }
-    metrics_path = output_dir / "metrics_lgb_baseline.json"
+    metrics_path = output_dir / f"metrics_{args.run_name}.json"
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("\nDone.")
