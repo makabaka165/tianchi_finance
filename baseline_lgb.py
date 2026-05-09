@@ -39,12 +39,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-estimators", type=int, default=2000, help="Maximum boosting rounds")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate")
     parser.add_argument("--num-leaves", type=int, default=64, help="Number of leaves")
+    parser.add_argument("--min-child-samples", type=int, default=50, help="Minimum data in one leaf")
+    parser.add_argument("--subsample", type=float, default=0.8, help="Row sampling ratio")
+    parser.add_argument("--colsample-bytree", type=float, default=0.8, help="Column sampling ratio")
+    parser.add_argument("--reg-alpha", type=float, default=0.1, help="L1 regularization")
+    parser.add_argument("--reg-lambda", type=float, default=0.1, help="L2 regularization")
     parser.add_argument("--early-stopping-rounds", type=int, default=100, help="Early stopping rounds")
     parser.add_argument("--sample-rows", type=int, default=0, help="Use first N train rows for a quick smoke test")
     parser.add_argument("--n-jobs", type=int, default=-1, help="LightGBM thread count")
     parser.add_argument("--target-encoding", action="store_true", help="Add fold-safe target encoding features")
     parser.add_argument("--target-encoding-splits", type=int, default=5, help="Inner folds for train target encoding")
     parser.add_argument("--target-encoding-smoothing", type=float, default=20.0, help="Smoothing for target encoding")
+    parser.add_argument("--category-combos", action="store_true", help="Add selected category combination features")
     return parser.parse_args()
 
 
@@ -139,6 +145,34 @@ def add_count_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         counts = key.value_counts(dropna=False)
         df[f"{col}_count"] = key.map(counts).astype("float32")
     return df
+
+
+def add_category_combo_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    combo_pairs = [
+        ("grade", "purpose"),
+        ("subGrade", "purpose"),
+        ("postCode", "purpose"),
+        ("regionCode", "purpose"),
+        ("postCode", "grade"),
+        ("postCode", "subGrade"),
+        ("issue_year", "grade"),
+        ("issue_year", "subGrade"),
+        ("issue_year", "purpose"),
+    ]
+    combo_cols: list[str] = []
+
+    for left, right in combo_pairs:
+        if left not in df.columns or right not in df.columns:
+            continue
+        combo_col = f"{left}_{right}_combo"
+        df[combo_col] = (
+            df[left].astype("string").fillna("__MISSING__")
+            + "_"
+            + df[right].astype("string").fillna("__MISSING__")
+        )
+        combo_cols.append(combo_col)
+
+    return df, combo_cols
 
 
 def add_group_stat_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -258,7 +292,11 @@ def add_fold_target_encoding(
     return X_train_aug, X_valid_aug, X_test_aug
 
 
-def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+def build_features(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    use_category_combos: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
     y = train["isDefault"].astype("int8")
     train_x = train.drop(columns=["isDefault"])
     all_data = pd.concat([train_x, test], axis=0, ignore_index=True)
@@ -268,6 +306,9 @@ def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFram
     all_data = add_grade_features(all_data)
     all_data = add_numeric_features(all_data)
     all_data = add_anonymous_aggregate_features(all_data)
+    combo_cols: list[str] = []
+    if use_category_combos:
+        all_data, combo_cols = add_category_combo_features(all_data)
     all_data = add_count_features(
         all_data,
         [
@@ -280,7 +321,8 @@ def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFram
             "subGrade",
             "homeOwnership",
             "verificationStatus",
-        ],
+        ]
+        + combo_cols,
     )
     all_data = add_group_stat_features(all_data)
 
@@ -291,7 +333,7 @@ def build_features(train: pd.DataFrame, test: pd.DataFrame) -> tuple[pd.DataFram
 
     X = all_data.iloc[: len(train)].reset_index(drop=True)
     X_test = all_data.iloc[len(train) :].reset_index(drop=True)
-    return X, X_test, y.tolist()
+    return X, X_test, y.tolist(), combo_cols
 
 
 def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
@@ -311,7 +353,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
     print(f"Train shape: {train.shape}, Test shape: {test.shape}")
 
     print("Building features...")
-    X, X_test, y = build_features(train, test)
+    X, X_test, y, combo_cols = build_features(train, test, args.category_combos)
     y_array = np.asarray(y)
     print(f"Feature shape: {X.shape}, Test feature shape: {X_test.shape}")
 
@@ -322,12 +364,12 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "learning_rate": args.learning_rate,
         "num_leaves": args.num_leaves,
         "max_depth": -1,
-        "min_child_samples": 50,
-        "subsample": 0.8,
+        "min_child_samples": args.min_child_samples,
+        "subsample": args.subsample,
         "subsample_freq": 1,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 0.1,
+        "colsample_bytree": args.colsample_bytree,
+        "reg_alpha": args.reg_alpha,
+        "reg_lambda": args.reg_lambda,
         "random_state": args.seed,
         "n_jobs": args.n_jobs,
         "verbosity": -1,
@@ -350,7 +392,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "title",
         "homeOwnership",
         "verificationStatus",
-    ]
+    ] + combo_cols
 
     for fold, (train_idx, valid_idx) in enumerate(skf.split(X, y_array), start=1):
         print(f"\nFold {fold}/{args.n_splits}")
@@ -411,6 +453,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         raise RuntimeError("No model was trained, feature importances are unavailable.")
     feature_importances["importance_mean"] = feature_importances.filter(like="fold_").mean(axis=1)
     feature_importances = feature_importances.sort_values("importance_mean", ascending=False)
+    trained_feature_count = int(feature_importances.shape[0])
     importance_path = output_dir / f"feature_importance_{args.run_name}.csv"
     feature_importances.to_csv(importance_path, index=False)
 
@@ -421,7 +464,8 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "elapsed_seconds": round(elapsed, 2),
         "train_shape": list(train.shape),
         "test_shape": list(test.shape),
-        "feature_count": int(X.shape[1]),
+        "base_feature_count": int(X.shape[1]),
+        "trained_feature_count": trained_feature_count,
         "submission_path": str(submission_path),
         "oof_path": str(oof_path),
         "importance_path": str(importance_path),
@@ -431,6 +475,10 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
             "cols": target_encoding_cols if args.target_encoding else [],
             "inner_splits": args.target_encoding_splits if args.target_encoding else None,
             "smoothing": args.target_encoding_smoothing if args.target_encoding else None,
+        },
+        "category_combos": {
+            "enabled": args.category_combos,
+            "cols": combo_cols,
         },
     }
     metrics_path = output_dir / f"metrics_{args.run_name}.json"
