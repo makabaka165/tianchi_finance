@@ -1,0 +1,34 @@
+# Data files
+train.csv
+testA.csv
+sample_submit.csv
+*.zip
+*.7z
+*.rar
+
+# Generated experiment outputs
+outputs/
+outputs_*/
+*.log
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
