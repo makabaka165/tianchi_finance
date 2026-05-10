@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oof", nargs="+", required=True, help="OOF csv files with columns isDefault,pred")
     parser.add_argument("--sub", nargs="+", required=True, help="Submission csv files with columns id,isDefault")
     parser.add_argument("--weights", nargs="+", type=float, default=None, help="Optional blend weights")
+    parser.add_argument("--search-step", type=float, default=0.0, help="Grid-search weights with this step if > 0")
     parser.add_argument("--output-dir", default="outputs_blend", help="Output directory")
     parser.add_argument("--run-name", default="blend", help="Output file prefix")
     return parser.parse_args()
@@ -34,23 +35,66 @@ def normalize_weights(weights: list[float] | None, n: int) -> np.ndarray:
 
 
 def blend_oof(paths: list[str], weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    y_true: np.ndarray | None = None
-    blended: np.ndarray | None = None
+    y_true, preds = load_oof_matrix(paths)
+    return y_true, preds @ weights
 
-    for path, weight in zip(paths, weights):
+
+def load_oof_matrix(paths: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    y_true: np.ndarray | None = None
+    preds: list[np.ndarray] = []
+
+    for path in paths:
         df = pd.read_csv(path)
         if not {"isDefault", "pred"}.issubset(df.columns):
             raise ValueError(f"{path} must contain isDefault and pred columns")
         if y_true is None:
             y_true = df["isDefault"].to_numpy()
-            blended = np.zeros(len(df), dtype=np.float64)
         elif not np.array_equal(y_true, df["isDefault"].to_numpy()):
             raise ValueError(f"{path} has a different target order")
-        blended += weight * df["pred"].to_numpy(dtype=np.float64)
+        preds.append(df["pred"].to_numpy(dtype=np.float64))
 
-    if y_true is None or blended is None:
+    if y_true is None or not preds:
         raise ValueError("No OOF files provided")
-    return y_true, blended
+    return y_true, np.column_stack(preds)
+
+
+def iter_weight_grid(n: int, step: float) -> list[np.ndarray]:
+    if n < 2:
+        return [np.ones(1, dtype=np.float64)]
+    if step <= 0 or step > 1:
+        raise ValueError("--search-step must be in (0, 1]")
+
+    units = int(round(1 / step))
+    if not np.isclose(units * step, 1.0):
+        raise ValueError("--search-step must divide 1.0 evenly, e.g. 0.1, 0.05, 0.02")
+
+    results: list[np.ndarray] = []
+
+    def backtrack(prefix: list[int], remaining: int, slots: int) -> None:
+        if slots == 1:
+            results.append(np.asarray(prefix + [remaining], dtype=np.float64) / units)
+            return
+        for value in range(remaining + 1):
+            backtrack(prefix + [value], remaining - value, slots - 1)
+
+    backtrack([], units, n)
+    return results
+
+
+def search_best_weights(paths: list[str], step: float) -> tuple[np.ndarray, float]:
+    y_true, preds = load_oof_matrix(paths)
+    best_auc = -np.inf
+    best_weights: np.ndarray | None = None
+
+    for weights in iter_weight_grid(preds.shape[1], step):
+        auc = roc_auc_score(y_true, preds @ weights)
+        if auc > best_auc:
+            best_auc = auc
+            best_weights = weights
+
+    if best_weights is None:
+        raise RuntimeError("No weights were searched")
+    return best_weights, float(best_auc)
 
 
 def blend_submission(paths: list[str], weights: np.ndarray) -> pd.DataFrame:
@@ -78,7 +122,11 @@ def main() -> None:
     if len(args.oof) != len(args.sub):
         raise ValueError("The number of OOF files must match the number of submission files")
 
-    weights = normalize_weights(args.weights, len(args.oof))
+    searched_auc: float | None = None
+    if args.search_step > 0:
+        weights, searched_auc = search_best_weights(args.oof, args.search_step)
+    else:
+        weights = normalize_weights(args.weights, len(args.oof))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,6 +146,8 @@ def main() -> None:
         "oof": args.oof,
         "sub": args.sub,
         "weights": weights.tolist(),
+        "search_step": args.search_step if args.search_step > 0 else None,
+        "searched_auc": searched_auc,
         "oof_path": str(oof_path),
         "submission_path": str(sub_path),
     }
