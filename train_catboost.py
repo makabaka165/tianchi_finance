@@ -55,7 +55,165 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thread-count", type=int, default=-1)
     parser.add_argument("--category-combos", action="store_true")
     parser.add_argument("--numeric-category-cols", action="store_true")
+    parser.add_argument("--forum-features", action="store_true")
     return parser.parse_args()
+
+
+FORUM_CAT_COLS = [
+    "employmentLength_bin",
+    "issueDate_bin",
+    "earliesCreditLine_bin",
+    "term_bin",
+    "interestRate_bin",
+    "annualIncome_bin",
+    "loanAmnt_bin",
+    "homeOwnership_bin",
+    "dti_bin",
+    "installment_bin",
+    "revolBal_bin",
+    "revolUtil_bin",
+]
+
+
+FORUM_RATIO_FEATURES = [
+    "loanAmnt",
+    "installment",
+    "interestRate",
+    "annualIncome",
+    "dti",
+    "openAcc",
+    "revolBal",
+    "revolUtil",
+    "totalAcc",
+]
+
+
+FORUM_PSI_DROP_COLS = [
+    "installment_homeOwnership_ratio",
+    "installment_purpose_ratio",
+    "revolBal_issueDate_ratio",
+    "revolBal_loanAmnt",
+    "annualIncome_installment",
+    "installment_issueDate_ratio",
+    "installment_employmentLength_ratio",
+    "revolUtil_issueDate_ratio",
+    "revolBal_purpose_ratio",
+    "revolBal_homeOwnership_ratio",
+    "revolBal_employmentLength_ratio",
+    "dti_issueDate_ratio",
+]
+
+
+def safe_ratio(numerator: pd.Series, denominator: pd.Series | np.ndarray | float) -> pd.Series:
+    denominator_series = pd.Series(denominator, index=numerator.index, dtype="float64").replace(0, np.nan)
+    return (numerator.astype("float64") / denominator_series).replace([np.inf, -np.inf], np.nan).astype("float32")
+
+
+def add_quantile_bin_feature(
+    df: pd.DataFrame,
+    source_col: str,
+    feature_name: str,
+    bins: int,
+) -> str | None:
+    if source_col not in df.columns:
+        return None
+    values = df[source_col].replace([np.inf, -np.inf], np.nan)
+    try:
+        binned = pd.qcut(values, q=bins, labels=False, duplicates="drop")
+    except ValueError:
+        return None
+    df[feature_name] = binned.fillna(-1).astype("int16")
+    return feature_name
+
+
+def add_group_median_ratio_features(
+    df: pd.DataFrame,
+    value_col: str,
+    group_col: str,
+    feature_name: str,
+) -> None:
+    if value_col not in df.columns or group_col not in df.columns:
+        return
+    group_key = df[group_col].fillna(-999999)
+    medians = df[value_col].groupby(group_key, dropna=False).transform("median")
+    df[feature_name] = safe_ratio(df[value_col], medians)
+
+
+def add_issue_date_window_features(df: pd.DataFrame, value_col: str) -> None:
+    if value_col not in df.columns or "issue_month_index" not in df.columns:
+        return
+    issue_values = sorted(df["issue_month_index"].dropna().unique().tolist())
+    value = df[value_col].astype("float64")
+    issue = df["issue_month_index"]
+
+    medians: dict[float, float] = {}
+    for issue_value in issue_values:
+        window_mask = issue.between(issue_value - 3, issue_value + 3)
+        medians[issue_value] = float(value.loc[window_mask].median())
+    median_feature = issue.map(medians).astype("float32")
+    df[f"{value_col}_issueDate_median"] = median_feature
+    df[f"{value_col}_issueDate_ratio"] = safe_ratio(df[value_col], median_feature)
+
+
+def add_forum_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    forum_cat_cols = [col for col in FORUM_CAT_COLS if col in df.columns]
+
+    df["date_Diff"] = (df["issue_month_index"] - df["earlies_credit_month_index"]).astype("float32")
+    df["dti"] = df["dti"].abs().fillna(1000).astype("float32")
+    df["installment_term_revolBal"] = safe_ratio(df["installment"] * 12 * df["term"], df["revolBal"] + 0.1)
+    df["revolUtil_revolBal"] = safe_ratio(df["revolUtil"], df["revolBal"] + 0.1)
+    df["openAcc_totalAcc"] = safe_ratio(df["openAcc"], df["totalAcc"])
+    df["loanAmnt_dti_annualIncome"] = safe_ratio(df["loanAmnt"], df["dti"].abs() * df["annualIncome"] + 0.1)
+    df["annualIncome_loanAmnt"] = safe_ratio(df["annualIncome"], df["loanAmnt"] + 0.1)
+    df["revolBal_loanAmnt"] = safe_ratio(df["revolBal"], df["loanAmnt"] + 0.1)
+    df["revolBal_installment"] = safe_ratio(df["revolBal"], df["installment"] + 0.1)
+    df["annualIncome_installment"] = safe_ratio(df["annualIncome"], df["installment"] + 0.1)
+
+    bin_sources = [
+        ("employmentLength", "employmentLength_bin", 11),
+        ("issue_month_index", "issueDate_bin", 120),
+        ("earlies_credit_month_index", "earliesCreditLine_bin", 120),
+        ("term", "term_bin", 2),
+        ("interestRate", "interestRate_bin", 100),
+        ("annualIncome", "annualIncome_bin", 10),
+        ("loanAmnt", "loanAmnt_bin", 10),
+        ("homeOwnership", "homeOwnership_bin", 10),
+        ("dti", "dti_bin", 100),
+        ("installment", "installment_bin", 100),
+        ("revolBal", "revolBal_bin", 100),
+        ("revolUtil", "revolUtil_bin", 100),
+    ]
+    for source_col, feature_name, bins in bin_sources:
+        if source_col in {"employmentLength", "issue_month_index", "earlies_credit_month_index", "term", "homeOwnership"}:
+            df[feature_name] = df[source_col].fillna(-1).astype("int32")
+            forum_cat_cols.append(feature_name)
+            continue
+        created = add_quantile_bin_feature(df, source_col, feature_name, bins)
+        if created is not None:
+            forum_cat_cols.append(created)
+
+    for value_col in FORUM_RATIO_FEATURES:
+        add_issue_date_window_features(df, value_col)
+        add_group_median_ratio_features(
+            df,
+            value_col,
+            "employmentLength",
+            f"{value_col}_employmentLength_ratio",
+        )
+        add_group_median_ratio_features(df, value_col, "purpose", f"{value_col}_purpose_ratio")
+        add_group_median_ratio_features(
+            df,
+            value_col,
+            "homeOwnership",
+            f"{value_col}_homeOwnership_ratio",
+        )
+
+    drop_cols = [col for col in FORUM_PSI_DROP_COLS if col in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    forum_cat_cols = [col for col in dict.fromkeys(forum_cat_cols) if col in df.columns]
+    return df, forum_cat_cols
 
 
 def build_features(
@@ -63,6 +221,7 @@ def build_features(
     test: pd.DataFrame,
     use_category_combos: bool,
     use_numeric_category_cols: bool,
+    use_forum_features: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, list[str]]:
     y = train["isDefault"].astype("int8").to_numpy()
     train_x = train.drop(columns=["isDefault"])
@@ -73,6 +232,10 @@ def build_features(
     all_data = add_grade_features(all_data)
     all_data = add_numeric_features(all_data)
     all_data = add_anonymous_aggregate_features(all_data)
+
+    forum_cat_cols: list[str] = []
+    if use_forum_features:
+        all_data, forum_cat_cols = add_forum_features(all_data)
 
     combo_cols: list[str] = []
     if use_category_combos:
@@ -88,7 +251,7 @@ def build_features(
         "subGrade",
         "homeOwnership",
         "verificationStatus",
-    ] + combo_cols
+    ] + combo_cols + forum_cat_cols
     all_data = add_count_features(all_data, count_cols)
     all_data = add_group_stat_features(all_data)
 
@@ -97,7 +260,9 @@ def build_features(
 
     cat_cols = all_data.select_dtypes(include=["object", "string", "category"]).columns.tolist()
     if use_numeric_category_cols:
-        cat_cols = sorted(set(cat_cols + combo_cols + [col for col in BASE_CAT_COLS if col in all_data.columns]))
+        cat_cols = sorted(
+            set(cat_cols + combo_cols + forum_cat_cols + [col for col in BASE_CAT_COLS if col in all_data.columns])
+        )
     for col in cat_cols:
         all_data[col] = all_data[col].astype("string").fillna("__MISSING__").astype(str)
 
@@ -127,7 +292,13 @@ def main() -> None:
     print(f"Train shape: {train.shape}, Test shape: {test.shape}")
 
     print("Building features...")
-    X, X_test, y, cat_cols = build_features(train, test, args.category_combos, args.numeric_category_cols)
+    X, X_test, y, cat_cols = build_features(
+        train,
+        test,
+        args.category_combos,
+        args.numeric_category_cols,
+        args.forum_features,
+    )
     cat_indices = [X.columns.get_loc(col) for col in cat_cols]
     print(f"Feature shape: {X.shape}, Test feature shape: {X_test.shape}, cat cols: {len(cat_cols)}")
 
@@ -203,6 +374,7 @@ def main() -> None:
         "params": params,
         "numeric_category_cols": args.numeric_category_cols,
         "category_combos": args.category_combos,
+        "forum_features": args.forum_features,
     }
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
