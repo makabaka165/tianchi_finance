@@ -51,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-encoding-splits", type=int, default=5, help="Inner folds for train target encoding")
     parser.add_argument("--target-encoding-smoothing", type=float, default=20.0, help="Smoothing for target encoding")
     parser.add_argument("--category-combos", action="store_true", help="Add selected category combination features")
+    parser.add_argument("--task3-feature-pack", choices=["none", "v1"], default="none", help="Optional Task3-style feature pack")
     return parser.parse_args()
 
 
@@ -135,6 +136,115 @@ def add_anonymous_aggregate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["n_max"] = n_data.max(axis=1, skipna=True).astype("float32")
     df["n_min"] = n_data.min(axis=1, skipna=True).astype("float32")
     return df
+
+
+def add_quantile_bin_feature(
+    df: pd.DataFrame,
+    source_col: str,
+    feature_name: str,
+    bins: int,
+) -> str | None:
+    if source_col not in df.columns:
+        return None
+    values = df[source_col].replace([np.inf, -np.inf], np.nan)
+    try:
+        binned = pd.qcut(values, q=bins, labels=False, duplicates="drop")
+    except ValueError:
+        return None
+    df[feature_name] = binned.fillna(-1).astype("int16")
+    return feature_name
+
+
+def add_three_sigma_outlier_flag(
+    df: pd.DataFrame,
+    source_col: str,
+    feature_name: str,
+) -> str | None:
+    if source_col not in df.columns:
+        return None
+    values = pd.to_numeric(df[source_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    std = values.std()
+    if pd.isna(std) or std == 0:
+        df[feature_name] = np.zeros(len(df), dtype=np.int8)
+        return feature_name
+    mean = values.mean()
+    lower = mean - 3 * std
+    upper = mean + 3 * std
+    df[feature_name] = ((values < lower) | (values > upper)).fillna(False).astype("int8")
+    return feature_name
+
+
+def add_task3_feature_pack(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    count_cols: list[str] = []
+    target_cols: list[str] = []
+    new_features: dict[str, pd.Series] = {}
+
+    loan_amnt = pd.to_numeric(df["loanAmnt"], errors="coerce")
+    width_bin = np.floor_divide(loan_amnt.fillna(-1000), 1000).astype("int32")
+    log_bin = pd.Series(
+        np.where(loan_amnt.notna(), np.floor(np.log10(np.clip(loan_amnt.to_numpy(dtype=np.float64), 1, None))), -1),
+        index=df.index,
+    ).astype("int16")
+    new_features["loanAmnt_bin_width"] = width_bin
+    new_features["loanAmnt_bin_log"] = log_bin
+    count_cols.extend(["loanAmnt_bin_width", "loanAmnt_bin_log"])
+
+    if new_features:
+        df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
+
+    quantile_cols = [
+        "loanAmnt",
+        "interestRate",
+        "annualIncome",
+        "dti",
+        "installment",
+        "revolBal",
+        "revolUtil",
+        "credit_history_months",
+    ]
+    quantile_feature_cols: list[str] = []
+    for source_col in quantile_cols:
+        feature_name = f"{source_col}_bin_q"
+        created = add_quantile_bin_feature(df, source_col, feature_name, bins=10)
+        if created is not None:
+            quantile_feature_cols.append(created)
+    count_cols.extend(quantile_feature_cols)
+
+    outlier_cols = [
+        "loanAmnt",
+        "interestRate",
+        "annualIncome",
+        "dti",
+        "installment",
+        "revolBal",
+        "revolUtil",
+        "fico_mean",
+        "openAcc",
+        "totalAcc",
+    ]
+    for source_col in outlier_cols:
+        add_three_sigma_outlier_flag(df, source_col, f"{source_col}_outlier_flag")
+
+    interaction_specs = [
+        ("grade", "loanAmnt_bin_q", "grade__loanAmnt_bin_q"),
+        ("subGrade", "interestRate_bin_q", "subGrade__interestRate_bin_q"),
+        ("purpose", "dti_bin_q", "purpose__dti_bin_q"),
+        ("homeOwnership", "annualIncome_bin_q", "homeOwnership__annualIncome_bin_q"),
+    ]
+    for left, right, feature_name in interaction_specs:
+        if left not in df.columns or right not in df.columns:
+            continue
+        df[feature_name] = (
+            df[left].astype("string").fillna("__MISSING__")
+            + "__"
+            + df[right].astype("string").fillna("__MISSING__")
+        )
+        count_cols.append(feature_name)
+        target_cols.append(feature_name)
+
+    count_cols = [col for col in dict.fromkeys(count_cols) if col in df.columns]
+    target_cols = [col for col in dict.fromkeys(target_cols) if col in df.columns]
+    return df, count_cols, target_cols
 
 
 def add_count_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -296,7 +406,8 @@ def build_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     use_category_combos: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    task3_feature_pack: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[int], list[str], list[str], list[str]]:
     y = train["isDefault"].astype("int8")
     train_x = train.drop(columns=["isDefault"])
     all_data = pd.concat([train_x, test], axis=0, ignore_index=True)
@@ -306,6 +417,10 @@ def build_features(
     all_data = add_grade_features(all_data)
     all_data = add_numeric_features(all_data)
     all_data = add_anonymous_aggregate_features(all_data)
+    task3_count_cols: list[str] = []
+    task3_target_cols: list[str] = []
+    if task3_feature_pack == "v1":
+        all_data, task3_count_cols, task3_target_cols = add_task3_feature_pack(all_data)
     combo_cols: list[str] = []
     if use_category_combos:
         all_data, combo_cols = add_category_combo_features(all_data)
@@ -322,7 +437,8 @@ def build_features(
             "homeOwnership",
             "verificationStatus",
         ]
-        + combo_cols,
+        + combo_cols
+        + task3_count_cols,
     )
     all_data = add_group_stat_features(all_data)
 
@@ -333,7 +449,7 @@ def build_features(
 
     X = all_data.iloc[: len(train)].reset_index(drop=True)
     X_test = all_data.iloc[len(train) :].reset_index(drop=True)
-    return X, X_test, y.tolist(), combo_cols
+    return X, X_test, y.tolist(), combo_cols, task3_target_cols, task3_count_cols
 
 
 def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
@@ -353,7 +469,12 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
     print(f"Train shape: {train.shape}, Test shape: {test.shape}")
 
     print("Building features...")
-    X, X_test, y, combo_cols = build_features(train, test, args.category_combos)
+    X, X_test, y, combo_cols, task3_target_cols, task3_count_cols = build_features(
+        train,
+        test,
+        args.category_combos,
+        args.task3_feature_pack,
+    )
     y_array = np.asarray(y)
     print(f"Feature shape: {X.shape}, Test feature shape: {X_test.shape}")
 
@@ -392,7 +513,7 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
         "title",
         "homeOwnership",
         "verificationStatus",
-    ] + combo_cols
+    ] + combo_cols + task3_target_cols
 
     for fold, (train_idx, valid_idx) in enumerate(skf.split(X, y_array), start=1):
         print(f"\nFold {fold}/{args.n_splits}")
@@ -475,6 +596,11 @@ def train_and_predict(args: argparse.Namespace) -> dict[str, object]:
             "cols": target_encoding_cols if args.target_encoding else [],
             "inner_splits": args.target_encoding_splits if args.target_encoding else None,
             "smoothing": args.target_encoding_smoothing if args.target_encoding else None,
+        },
+        "task3_feature_pack": {
+            "name": args.task3_feature_pack,
+            "count_cols": task3_count_cols,
+            "target_cols": task3_target_cols,
         },
         "category_combos": {
             "enabled": args.category_combos,

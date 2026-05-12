@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category-combos", action="store_true")
     parser.add_argument("--numeric-category-cols", action="store_true")
     parser.add_argument("--forum-features", action="store_true")
+    parser.add_argument("--forum-category-combos", choices=["none", "v1"], default="none")
     return parser.parse_args()
 
 
@@ -102,8 +103,6 @@ FORUM_PSI_DROP_COLS = [
     "revolBal_employmentLength_ratio",
     "dti_issueDate_ratio",
 ]
-
-
 def safe_ratio(numerator: pd.Series, denominator: pd.Series | np.ndarray | float) -> pd.Series:
     denominator_series = pd.Series(denominator, index=numerator.index, dtype="float64").replace(0, np.nan)
     return (numerator.astype("float64") / denominator_series).replace([np.inf, -np.inf], np.nan).astype("float32")
@@ -153,6 +152,26 @@ def add_issue_date_window_features(df: pd.DataFrame, value_col: str) -> None:
     median_feature = issue.map(medians).astype("float32")
     df[f"{value_col}_issueDate_median"] = median_feature
     df[f"{value_col}_issueDate_ratio"] = safe_ratio(df[value_col], median_feature)
+
+
+def add_forum_category_combos(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    combo_specs = [
+        ("grade", "purpose", "grade__purpose"),
+        ("subGrade", "homeOwnership", "subGrade__homeOwnership"),
+        ("purpose", "verificationStatus", "purpose__verificationStatus"),
+        ("issueDate_bin", "subGrade", "issueDate_bin__subGrade"),
+    ]
+    combo_cols: list[str] = []
+    for left, right, feature_name in combo_specs:
+        if left not in df.columns or right not in df.columns:
+            continue
+        df[feature_name] = (
+            df[left].astype("string").fillna("__MISSING__")
+            + "__"
+            + df[right].astype("string").fillna("__MISSING__")
+        )
+        combo_cols.append(feature_name)
+    return df, combo_cols
 
 
 def add_forum_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -215,13 +234,13 @@ def add_forum_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     forum_cat_cols = [col for col in dict.fromkeys(forum_cat_cols) if col in df.columns]
     return df, forum_cat_cols
 
-
 def build_features(
     train: pd.DataFrame,
     test: pd.DataFrame,
     use_category_combos: bool,
     use_numeric_category_cols: bool,
     use_forum_features: bool,
+    forum_category_combos: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, list[str]]:
     y = train["isDefault"].astype("int8").to_numpy()
     train_x = train.drop(columns=["isDefault"])
@@ -236,6 +255,9 @@ def build_features(
     forum_cat_cols: list[str] = []
     if use_forum_features:
         all_data, forum_cat_cols = add_forum_features(all_data)
+    forum_combo_cols: list[str] = []
+    if forum_category_combos == "v1":
+        all_data, forum_combo_cols = add_forum_category_combos(all_data)
 
     combo_cols: list[str] = []
     if use_category_combos:
@@ -251,7 +273,7 @@ def build_features(
         "subGrade",
         "homeOwnership",
         "verificationStatus",
-    ] + combo_cols + forum_cat_cols
+    ] + combo_cols + forum_cat_cols + forum_combo_cols
     all_data = add_count_features(all_data, count_cols)
     all_data = add_group_stat_features(all_data)
 
@@ -298,6 +320,7 @@ def main() -> None:
         args.category_combos,
         args.numeric_category_cols,
         args.forum_features,
+        args.forum_category_combos,
     )
     cat_indices = [X.columns.get_loc(col) for col in cat_cols]
     print(f"Feature shape: {X.shape}, Test feature shape: {X_test.shape}, cat cols: {len(cat_cols)}")
@@ -375,6 +398,7 @@ def main() -> None:
         "numeric_category_cols": args.numeric_category_cols,
         "category_combos": args.category_combos,
         "forum_features": args.forum_features,
+        "forum_category_combos": args.forum_category_combos,
     }
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
