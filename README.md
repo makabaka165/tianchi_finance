@@ -6,6 +6,20 @@
 
 **以 LightGBM 建立稳定基线，以 CatBoost 承担主力建模，用无泄漏特征工程强化风险表达，再通过 OOF 驱动的线性融合提取最后一段增益。**
 
+## 快速摘要
+
+| 项目 | 内容 |
+| --- | --- |
+| 任务类型 | 金融风控表格二分类 |
+| 评价指标 | `AUC` |
+| 基础模型 | `LightGBM` |
+| 主力模型 | `CatBoost` |
+| 最关键特征 | 分箱特征、比例特征、时间窗口统计、分组相对位置特征 |
+| 最有效策略 | `CatBoost` 主线 + 少量高质量类别组合 + OOF 线性融合 |
+| 正式最优 AUC | `0.746763003490295` |
+| 本地最高候选 AUC | `0.7470961136601179` |
+| 当前仓库定位 | 可复现的比赛解决方案与完整复盘工程 |
+
 ## 一、项目定位
 
 ### 1. 比赛任务
@@ -26,7 +40,22 @@
 2. 记录每一轮提分实验的判断依据与结果
 3. 为后续复盘、迁移和二次优化提供结构化材料
 
-## 二、结果概览
+## 二、方法流程图
+
+```mermaid
+flowchart TD
+    A["原始数据<br/>train.csv / testA.csv"] --> B["基础特征工程<br/>日期、等级、比例、计数、分组统计"]
+    B --> C["LightGBM 基线训练<br/>5 折 StratifiedKFold + OOF"]
+    B --> D["CatBoost 主力训练<br/>论坛启发特征包"]
+    D --> E["少量类别组合增强<br/>EXP033"]
+    C --> F["OOF 融合搜索"]
+    D --> F
+    E --> F
+    F --> G["本地 OOF AUC 评估"]
+    G --> H["保留 / 回退决策"]
+```
+
+## 三、结果概览
 
 ### 1. 本地 OOF 演进
 
@@ -61,7 +90,7 @@
 
 这两个结果共同构成了当前仓库最有参考价值的方案上界。
 
-## 三、方案摘要
+## 四、方案摘要
 
 当前最有效的主线不是继续堆模型数量，而是把以下五件事做好：
 
@@ -87,7 +116,7 @@
 - 最优双模型权重：约 `0.495 / 0.505`
 - 本地 OOF AUC：`0.7470961136601179`
 
-## 四、真正有效的提分机制
+## 五、真正有效的提分机制
 
 ## 1. LightGBM 负责搭建稳定骨架
 
@@ -201,7 +230,7 @@
 - 复杂变换没有创造新的有效信息
 - 新模型只有在确实提供差异时才值得进入融合池
 
-## 五、收益较低或被证伪的方向
+## 六、收益较低或被证伪的方向
 
 后期很多方向都跑通过，但收益有限，甚至明确失败：
 
@@ -214,7 +243,16 @@
 
 这也是为什么当前代码最终停在“CatBoost 主线 + 少量类别组合增强”这个形态，而没有继续沿复杂融合或大规模特征裁剪方向推进。
 
-## 六、仓库结构
+## 七、关键经验总结
+
+1. 先把 OOF 验证体系搭稳，再谈提分。
+2. 在这个任务上，类别建模质量比盲目堆参数更重要。
+3. 分箱和比例特征比很多表面复杂的统计特征更稳定。
+4. 真正有价值的交互特征不需要很多，但必须有明确业务语义。
+5. OOF 驱动的线性融合长期有效，复杂融合形式不一定更强。
+6. 后期大多数失败实验都说明一件事：高分阶段更需要“少量高质量增量”，而不是继续扩张特征规模。
+
+## 八、仓库结构
 
 ```text
 .
@@ -235,7 +273,7 @@
 - 训练输出目录主要用于本地复盘与结果对照
 - 官网提交留档目前保留在本地，不作为主仓库受控内容提交
 
-## 七、环境准备
+## 九、环境准备
 
 推荐使用 Conda / Miniforge：
 
@@ -251,7 +289,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe env create -f environment.yml
 C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python baseline_lgb.py
 ```
 
-## 八、数据文件
+## 十、数据文件
 
 本仓库不提交原始比赛数据，请自行放在项目根目录：
 
@@ -259,7 +297,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python baseli
 - `testA.csv`
 - `sample_submit.csv`
 
-## 九、复现入口
+## 十一、复现入口
 
 ## 1. 运行 LightGBM 基线
 
@@ -299,7 +337,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python train_
 C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python blend_predictions.py --oof E:\tianchi_finance\outputs_blend_exp023\oof_blend_exp023_lgb_cat_forum.csv E:\tianchi_finance\outputs_cat_exp033_combo\oof_cat_exp033_combo.csv --sub E:\tianchi_finance\outputs_blend_exp023\submission_blend_exp023_lgb_cat_forum.csv E:\tianchi_finance\outputs_cat_exp033_combo\submission_cat_exp033_combo.csv --search-step 0.005 --output-dir E:\tianchi_finance\outputs_blend_exp034_none_rebuild --run-name blend_exp034_pair_none
 ```
 
-## 十、实验流程
+## 十二、实验流程
 
 后期实验遵循统一流程：
 
@@ -316,7 +354,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python blend_
 - 降低无效试错
 - 保证每一轮实验都有清晰的记录与回退依据
 
-## 十一、建议阅读顺序
+## 十三、建议阅读顺序
 
 如果只想快速理解这套方案，建议按下面顺序阅读：
 
@@ -326,7 +364,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python blend_
 4. `baseline_lgb.py`
 5. `blend_predictions.py`
 
-## 十二、使用建议
+## 十四、使用建议
 
 如果后续准备基于这套代码继续训练，建议坚持以下原则：
 
