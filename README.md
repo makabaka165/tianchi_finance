@@ -1,26 +1,34 @@
 # 天池金融风控贷款违约预测解决方案
 
-这是一个围绕天池金融风控贷款违约预测赛题搭建的完整解决方案仓库。
+本仓库记录了一套围绕天池金融风控贷款违约预测赛题构建的完整解决方案。它不是单次训练脚本的备份，而是一条从基线搭建、特征工程、模型差异化到 OOF 融合提分的完整演进路径。
 
-仓库里保留的不是单次提交代码，而是一整套可复现、可回看、可继续优化的本地实验体系，主要包括：
+如果把这套方案压缩成一句话，可以概括为：
 
-- LightGBM 基线与后续差异化实验
-- CatBoost 主力方案
-- 基于 OOF 的融合脚本
-- 分阶段实验记录
-- 高分方案总结文档
+**以 LightGBM 建立稳定基线，以 CatBoost 承担主力建模，用无泄漏特征工程强化风险表达，再通过 OOF 驱动的线性融合提取最后一段增益。**
 
-## 一、比赛任务
+## 一、项目定位
 
-任务目标：根据借款人的贷款、信用、负债和历史行为特征，预测测试集样本的违约概率 `isDefault`。
+### 1. 比赛任务
 
-评估指标：`AUC`
+根据借款人的贷款、信用、负债和历史行为特征，预测测试集样本的违约概率 `isDefault`。
 
-这个任务本质上是一个标准的风控表格二分类问题。模型最重要的不是把概率校准得非常精确，而是尽可能把高风险样本排在前面、低风险样本排在后面。
+### 2. 评价指标
 
-## 二、当前结果概览
+比赛指标为 `AUC`。
 
-### 1. 本地 OOF 结果
+这意味着模型优化的重点不是把概率校准到绝对准确，而是尽量提高风险排序能力，让高风险样本排在前面，低风险样本排在后面。
+
+### 3. 仓库目标
+
+这个仓库主要服务三个目标：
+
+1. 保留一条可复现的比赛解决方案主线
+2. 记录每一轮提分实验的判断依据与结果
+3. 为后续复盘、迁移和二次优化提供结构化材料
+
+## 二、结果概览
+
+### 1. 本地 OOF 演进
 
 | 阶段 | 本地 OOF AUC | 说明 |
 | --- | ---: | --- |
@@ -31,50 +39,59 @@
 | 按保留规则更新的正式最优 | `0.746763003490295` | `EXP023` |
 | 本地已验证最高候选 | `0.7470961136601179` | `EXP034 none` |
 
-### 2. 官网已提交结果
+### 2. 当前需要区分的两个最佳
 
-仓库中单独保留了官网提交留档，见 `official_submissions/README.md`。
+为了避免混淆，这里明确区分两个“最佳”概念：
 
-当前已知最高官网分数对应文件：
+#### 正式最优
 
-- 文件：`official_submissions/submission_blend_exp034_pair_none.csv`
-- 官网分数：`0.7468`
+这是按当前实验保留规则更新过的正式 best：
 
-## 三、最终方案概述
+- AUC：`0.746763003490295`
+- 文件：`outputs_blend_exp023/submission_blend_exp023_lgb_cat_forum.csv`
+- 指标：`outputs_blend_exp023/metrics_blend_exp023_lgb_cat_forum.json`
 
-当前最有效的主线不是不断增加模型数量，而是：
+#### 本地已验证最高候选
 
-**LightGBM 打底 + CatBoost 主力建模 + 论坛启发的无泄漏特征工程 + 少量高价值类别组合 + 基于 OOF 的线性融合**
+这是本地 OOF 更高、但未按当时规则升级为正式 best 的候选方案：
 
-### 1. 按规则保留的正式最优方案
+- AUC：`0.7470961136601179`
+- 文件：`outputs_blend_exp034_none/submission_blend_exp034_pair_none.csv`
+- 指标：`outputs_blend_exp034_none/metrics_blend_exp034_pair_none.json`
+
+这两个结果共同构成了当前仓库最有参考价值的方案上界。
+
+## 三、方案摘要
+
+当前最有效的主线不是继续堆模型数量，而是把以下五件事做好：
+
+1. 建立稳定的 LightGBM 基线
+2. 用 CatBoost 接管高质量类别建模
+3. 引入无泄漏的论坛启发特征工程
+4. 只增加少量高价值类别交互
+5. 用 OOF 线性融合而不是手工拍脑袋调权
+
+最终形成的核心结构如下：
+
+### 1. 正式最优方案
 
 - 基础融合：`output/outputs_blend_exp012`
 - 主力模型：`outputs_cat_exp023_forum`
 - 融合权重：`0.09 / 0.91`
 - 本地 OOF AUC：`0.746763003490295`
 
-对应输出：
-
-- `outputs_blend_exp023/submission_blend_exp023_lgb_cat_forum.csv`
-- `outputs_blend_exp023/metrics_blend_exp023_lgb_cat_forum.json`
-
-### 2. 本地已验证最高候选方案
+### 2. 本地最高候选方案
 
 - 基础：`outputs_blend_exp023`
 - 增强模型：`outputs_cat_exp033_combo`
-- 最优双模型融合权重：约 `0.495 / 0.505`
+- 最优双模型权重：约 `0.495 / 0.505`
 - 本地 OOF AUC：`0.7470961136601179`
 
-对应输出：
+## 四、真正有效的提分机制
 
-- `outputs_blend_exp034_none/submission_blend_exp034_pair_none.csv`
-- `outputs_blend_exp034_none/metrics_blend_exp034_pair_none.json`
+## 1. LightGBM 负责搭建稳定骨架
 
-## 四、真正有效的提分措施
-
-## 1. 先建立稳定的 LightGBM 基线
-
-`baseline_lgb.py` 提供了整个项目的基础训练骨架，主要包含：
+`baseline_lgb.py` 提供了整套方案的基础训练骨架，包含：
 
 - 5 折 `StratifiedKFold` OOF 验证
 - 日期特征
@@ -84,26 +101,28 @@
 - 分组统计特征
 - 可选的 CV 安全目标编码
 
-这条线的主要价值有两个：
+这条线的价值主要体现在两点：
 
-1. 建立稳定、可复现的表格模型基线
-2. 为后续 CatBoost 融合提供差异来源
+1. 它建立了一个稳定、可解释、可重复的表格基线
+2. 它为后续 CatBoost 融合提供了差异来源
 
-## 2. CatBoost 成为主力模型
+## 2. CatBoost 承担主力建模任务
 
-后续最大的提升来自 `train_catboost.py` 对 CatBoost 路线的强化。
+后期最明显的分数跃迁来自 `train_catboost.py` 这条线。
 
-主要原因：
+原因并不复杂：
 
 - 对高基数类别特征的处理更自然
-- 对类别与数值交互的建模能力更强
-- 在当前风控表格场景下，类别信息利用效率高于早期 LightGBM 基线
+- 对类别与数值交互的建模更强
+- 在当前风控表格场景中，类别信息的利用效率明显高于早期 LightGBM 基线
 
-## 3. 论坛启发特征包是最关键升级
+换句话说，后面的关键升级不是“换一个模型试试”，而是找到了更适合这类数据结构的主力模型。
 
-`EXP023` 的核心提升来自论坛方案中真正有价值、且不泄漏标签的信息，而不是直接照搬帖子。
+## 3. 论坛启发特征包是决定性升级
 
-关键特征包括：
+`EXP023` 的真正价值，不是简单照搬论坛帖子，而是把其中有效、无泄漏、可本地验证的部分落到了代码里。
+
+关键特征可以概括为四类：
 
 ### 分箱特征
 
@@ -117,6 +136,8 @@
 - `revolBal_bin`
 - `revolUtil_bin`
 
+作用：让树模型更容易学习风险区间，而不是强行从连续变量里硬拆阈值。
+
 ### 比例特征
 
 - `installment_term_revolBal`
@@ -125,75 +146,73 @@
 - `loanAmnt_dti_annualIncome`
 - `annualIncome_loanAmnt`
 
+作用：强化偿债压力、流动性紧张程度和借款规模合理性表达。
+
 ### 时间窗口统计
 
 - `*_issueDate_median`
 - `*_issueDate_ratio`
 
+作用：把样本放回它所处的放款时间环境中去比较，表达同一时期下的相对异常程度。
+
 ### 同群体相对位置特征
 
-按以下群体生成分组中位数比例：
+按以下群体构造分组中位数比例：
 
 - `employmentLength`
 - `purpose`
 - `homeOwnership`
 
+作用：把个体样本和“同类人群”的正常水平做对照。
+
 ### 高 PSI 黑名单剔除
 
-通过删除部分不稳定特征，降低漂移风险。
+通过删除部分明显不稳定特征，降低分布漂移带来的伪增益风险。
 
-这些特征本质上都在强化几类关键信号：
+## 4. 少量高质量类别组合带来最后一段增益
 
-- 偿债压力
-- 额度利用率
-- 收入与借款规模关系
-- 信用历史成熟度
-- 同时期、同群体下的相对异常程度
-
-## 4. 少量高质量类别组合带来最后一段有效增益
-
-`EXP033` 在 `EXP023` 基础上只增加了 4 组论坛类别组合：
+`EXP033` 只增加了 4 组类别组合：
 
 - `grade__purpose`
 - `subGrade__homeOwnership`
 - `purpose__verificationStatus`
 - `issueDate_bin__subGrade`
 
-这一步非常克制，但收益明确：
+这一步的价值在于，它没有把特征空间做大规模爆炸，而是只补充了少量强交互：
 
 - 单模型 AUC：`0.7467878225714177`
 - 融合后 AUC：`0.7470960981385554`
 
-说明少量高质量交互特征，比大规模特征扩张更有效。
+这说明在当前任务里，少量高质量交互远比大规模组合更有效。
 
-## 5. 基于 OOF 的线性融合始终最好
+## 5. OOF 线性融合始终优于复杂变换
 
 后期依次验证过：
 
 - 双模型线性融合
-- 更细粒度网格搜索
-- 排序变换融合
-- `logit` 变换融合
+- 更细粒度权重搜索
+- 排序融合
+- `logit` 融合
 - 三模型融合
 
-结论很明确：
+最终结论非常明确：
 
-- 普通线性融合最好
-- 复杂变换没有带来实质收益
-- 额外模型只有在确实提供新信息时才有价值
+- 简单线性融合最好
+- 复杂变换没有创造新的有效信息
+- 新模型只有在确实提供差异时才值得进入融合池
 
-## 五、被证明收益较低的方向
+## 五、收益较低或被证伪的方向
 
-后期很多方向都跑通过，但收益有限，或者直接失败：
+后期很多方向都跑通过，但收益有限，甚至明确失败：
 
-- LightGBM 差异化补充模型：能跑通，但与主力 CatBoost 的互补性不够强
-- 论坛特征筛选：`EXP032` 虽然过了 smoke，但 full 明显变弱
-- 基于对抗验证的漂移剔除：AUC 接近 `0.5`，说明不是当前主瓶颈
+- LightGBM 差异化补充模型：可运行，但与主力 CatBoost 的互补性不够强
+- 论坛特征筛选：`EXP032` 虽过 smoke，但 full 明显变弱
+- 对抗验证驱动的漂移剔除：AUC 接近 `0.5`，不是当前核心瓶颈
 - 过度压缩类别组合：`EXP036` 反而掉分
 - 轻量 combo-stat 增补：`EXP037` smoke 未过
-- 排序融合与 `logit` 融合：都不如简单线性融合
+- 排序融合与 `logit` 融合：均不如线性融合
 
-这也是当前仓库最终停留在“CatBoost 主线 + 少量类别组合增强”的原因。
+这也是为什么当前代码最终停在“CatBoost 主线 + 少量类别组合增强”这个形态，而没有继续沿复杂融合或大规模特征裁剪方向推进。
 
 ## 六、仓库结构
 
@@ -202,14 +221,19 @@
 ├─ baseline_lgb.py                 # LightGBM 基线与变体
 ├─ train_catboost.py               # CatBoost 主力方案
 ├─ blend_predictions.py            # OOF / submission 融合脚本
-├─ environment.yml                 # Conda 环境
+├─ environment.yml                 # Conda 环境定义
 ├─ 实验记录.md                     # 完整实验记录
 ├─ 比赛总结与高分方案.md           # 详细复盘与方法总结
 ├─ PLAN.md                         # 目标模式实验规则
-├─ official_submissions/           # 官网提交留档
 ├─ output/                         # 历史输出目录
 └─ outputs_*/                      # 各轮实验产物
 ```
+
+说明：
+
+- 原始数据文件不纳入版本管理
+- 训练输出目录主要用于本地复盘与结果对照
+- 官网提交留档目前保留在本地，不作为主仓库受控内容提交
 
 ## 七、环境准备
 
@@ -235,7 +259,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python baseli
 - `testA.csv`
 - `sample_submit.csv`
 
-## 九、如何复现
+## 九、复现入口
 
 ## 1. 运行 LightGBM 基线
 
@@ -249,7 +273,7 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python baseli
 C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python baseline_lgb.py --sample-rows 50000 --n-splits 3 --n-estimators 300 --early-stopping-rounds 30 --output-dir outputs_smoke
 ```
 
-## 2. 运行 `EXP023` 强力 CatBoost 方案
+## 2. 运行 `EXP023` CatBoost 主力方案
 
 ```powershell
 C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python train_catboost.py --train-path E:\tianchi_finance\train.csv --test-path E:\tianchi_finance\testA.csv --iterations 2500 --learning-rate 0.05 --depth 6 --l2-leaf-reg 5 --early-stopping-rounds 180 --output-dir E:\tianchi_finance\outputs_cat_exp023_forum --run-name cat_exp023_forum --numeric-category-cols --forum-features
@@ -275,26 +299,26 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python train_
 C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python blend_predictions.py --oof E:\tianchi_finance\outputs_blend_exp023\oof_blend_exp023_lgb_cat_forum.csv E:\tianchi_finance\outputs_cat_exp033_combo\oof_cat_exp033_combo.csv --sub E:\tianchi_finance\outputs_blend_exp023\submission_blend_exp023_lgb_cat_forum.csv E:\tianchi_finance\outputs_cat_exp033_combo\submission_cat_exp033_combo.csv --search-step 0.005 --output-dir E:\tianchi_finance\outputs_blend_exp034_none_rebuild --run-name blend_exp034_pair_none
 ```
 
-## 十、训练流程
+## 十、实验流程
 
-后期实验采用固定流程：
+后期实验遵循统一流程：
 
-1. 先在 `实验记录.md` 追加本轮计划
+1. 先在 `实验记录.md` 中追加本轮实验计划
 2. 先跑 smoke test
 3. smoke 达标后才跑 full 5 折
-4. full 完成后必须与当前 best 直接比较或融合
+4. full 完成后必须与当前 best 直接比较或做融合
 5. 验证 submission 格式
-6. 只用本地 OOF AUC 判断是否保留
+6. 只用本地 OOF AUC 作为保留依据
 
-这个流程的好处是：
+这个流程的价值在于：
 
 - 节省长时间 full 训练成本
 - 降低无效试错
-- 每一步都有明确记录与回退依据
+- 保证每一轮实验都有清晰的记录与回退依据
 
 ## 十一、建议阅读顺序
 
-如果你只想快速理解这套方案，建议按下面顺序阅读：
+如果只想快速理解这套方案，建议按下面顺序阅读：
 
 1. `比赛总结与高分方案.md`
 2. `实验记录.md`
@@ -302,19 +326,13 @@ C:\Users\makab\Miniforge3\Scripts\conda.exe run -n tianchi_finance python blend_
 4. `baseline_lgb.py`
 5. `blend_predictions.py`
 
-## 十二、说明
+## 十二、使用建议
 
-- 仓库中的 `outputs_*` 目录主要用于保留实验产物和复盘，不建议全部提交到 Git。
-- 最终高分方案更依赖特征表达质量和模型差异，而不是更复杂的融合框架。
-- 如果后续继续提分，优先方向仍应围绕当前 CatBoost 主线做高质量小改动，而不是推翻整个流程。
-
-## 十三、使用建议
-
-这份仓库更适合作为比赛复盘和方法借鉴材料使用。
-
-如果你准备基于这套代码继续训练，建议优先保持以下原则：
+如果后续准备基于这套代码继续训练，建议坚持以下原则：
 
 - 保留 OOF 驱动的验证与融合方式
-- 控制新增特征的质量而不是数量
+- 控制新增特征的质量，而不是一味增加数量
 - 尽量避免引入目标泄漏风险
-- 所有提升都用本地 OOF AUC 说话
+- 所有保留决策都由本地 OOF AUC 驱动
+
+这套仓库更适合作为比赛复盘、方法借鉴和后续迁移的基础工程来使用。
